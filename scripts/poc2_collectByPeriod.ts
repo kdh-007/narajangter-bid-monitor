@@ -132,18 +132,23 @@ async function fetchOperation(opPath: string, fromDate: string, toDate: string):
   const numOfRows = 500;
 
   while (true) {
-    const url = new URL(`${BASE_URL}/${opPath}`);
-    url.searchParams.set("serviceKey", SERVICE_KEY!);
-    url.searchParams.set("pageNo", String(pageNo));
-    url.searchParams.set("numOfRows", String(numOfRows));
-    url.searchParams.set("inqryDiv", "1"); // 1 = 날짜기준 조회 (실측 필요)
-    url.searchParams.set("inqryBgnDt", toApiDate(fromDate));
-    url.searchParams.set("inqryEndDt", toApiDate(toDate, true));
-    url.searchParams.set("type", "json");
+    // ⚠ serviceKey는 공공데이터포털에서 이미 URL 인코딩된 값(Encoding 키)인 경우가 많아서,
+    //    URLSearchParams.set()으로 넣으면 이중 인코딩되어 400 에러가 남. 그래서 이 값만 직접 문자열에 붙임.
+    const otherParams = new URLSearchParams({
+      pageNo: String(pageNo),
+      numOfRows: String(numOfRows),
+      inqryDiv: "1", // 1 = 날짜기준 조회 (실측 필요)
+      inqryBgnDt: toApiDate(fromDate),
+      inqryEndDt: toApiDate(toDate, true),
+      type: "json",
+    });
+    const url = `${BASE_URL}/${opPath}?serviceKey=${SERVICE_KEY}&${otherParams.toString()}`;
 
-    const res = await fetch(url.toString());
+    const res = await fetch(url);
     if (!res.ok) {
+      const bodyText = await res.text();
       console.error(`  ! HTTP ${res.status} — ${opPath} (${fromDate}~${toDate})`);
+      console.error(`    응답 내용: ${bodyText.slice(0, 500)}`);
       break;
     }
     const data: any = await res.json();
