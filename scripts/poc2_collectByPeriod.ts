@@ -2,25 +2,27 @@
  * PoC2 — 계약방법 분기 검증용 공고 수집 스크립트
  *
  * 목적: 2026-06-01 ~ 2026-09-11 사이 게시된 본공고 중 기존 config/keywords.json 기준으로
- *       지일 사업과 관련된 공고만 걸러 수집하고, 계약방법 관련 후보 필드를 함께 저장한다.
+ *       지일 사업과 관련된 공고만 걸러 수집하고, 계약방법 관련 후보 필드를 함께
+ *       Supabase(poc2_notices 테이블)에 저장한다.
  *       이 결과에서 계약방법이 서로 다른 5건을 골라 PoC2 정답표에 채워 넣는 데 쓴다.
  *
  * 실행 전 준비
- *   1. .env에 DATA_GO_KR_SERVICE_KEY=... 값 필요 (공공데이터포털 발급키)
+ *   1. .env에 DATA_GO_KR_SERVICE_KEY, SUPABASE_URL, SUPABASE_KEY 값 필요
  *   2. narajangter-bid-monitor/ 저장소 루트에서 실행한다고 가정 (config/keywords.json 상대경로 기준)
- *   3. Node 18+ : npx tsx scripts/poc2_collectByPeriod.ts
+ *   3. Node 18+ : npm install 후 npx tsx scripts/poc2_collectByPeriod.ts
  *
  * 실행 전 반드시 확인/조정해야 할 것 (직접 실측 안 해본 부분이라 확신 없음)
  *   - BASE_URL의 버전 접미사(BidPublicInfoService04 등)가 현재 유효한지
  *     → data.go.kr "나라장터 입찰공고정보서비스" 활용신청 상세페이지에서 실제 Endpoint 확인
  *   - inqryBgnDt/inqryEndDt 파라미터 포맷(yyyyMMddHHmm, 12자리)과 조회 가능 기간 제한 여부
  *   - "계약방법"이 실제로 cntrctCnclsMthdNm 필드에 오는지, 아니면 sucsfbidMthdNm(낙찰방법명)
- *     쪽에 오는지 → 그래서 두 필드를 CSV에 같이 남겨서 실행 후 눈으로 확인하도록 만듦
+ *     쪽에 오는지 → 그래서 두 필드를 DB에 같이 남겨서 실행 후 눈으로 확인하도록 만듦
  */
 
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { createClient } from "@supabase/supabase-js";
 
 // ---------- 설정 ----------
 
@@ -29,6 +31,14 @@ if (!SERVICE_KEY) {
   console.error("환경변수 DATA_GO_KR_SERVICE_KEY가 없습니다. .env를 확인하세요.");
   process.exit(1);
 }
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("환경변수 SUPABASE_URL / SUPABASE_KEY가 없습니다. .env를 확인하세요.");
+  process.exit(1);
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // 조사 기간 (필요시 직접 수정)
 const PERIOD_START = "2026-06-01";
@@ -44,9 +54,6 @@ const keywordsConfig = JSON.parse(
   minBudgetAmount: number;
 };
 
-const OUTPUT_DIR = path.resolve(process.cwd(), "output/poc2");
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
 // 나라장터 입찰공고정보서비스 — 업무구분별 "검색조건별 목록" 오퍼레이션
 // ⚠ 버전 접미사(04)는 확인 필요 — data.go.kr 상세페이지의 Endpoint로 교체할 것
 const BASE_URL = "https://apis.data.go.kr/1230000/BidPublicInfoService04";
@@ -59,17 +66,18 @@ const OPERATIONS: { label: string; path: string }[] = [
 type RawItem = Record<string, any>;
 
 interface CollectedRow {
-  업무구분: string;
-  공고번호: string;
-  공고차수: string;
-  공고명: string;
-  발주기관: string;
-  수요기관: string;
-  추정가격: string;
-  입찰방식명: string; // bidMethdNm — "전자입찰" 등. 계약방법과는 다른 필드이니 혼동 주의
-  계약방법명_후보1: string; // cntrctCnclsMthdNm 추정
-  낙찰방법명_후보2: string; // sucsfbidMthdNm 추정
-  공고게시일시: string;
+  work_type: string;
+  bid_ntce_no: string;
+  bid_ntce_ord: string;
+  bid_ntce_nm: string;
+  ntce_instt_nm: string;
+  dminstt_nm: string;
+  presmpt_prce: number | null;
+  bid_methd_nm: string; // bidMethdNm — "전자입찰" 등. 계약방법과는 다른 필드이니 혼동 주의
+  cntrct_mthd_candidate: string; // cntrctCnclsMthdNm 추정
+  sucsfbid_mthd_candidate: string; // sucsfbidMthdNm 추정
+  bid_ntce_dt: string;
+  raw: RawItem;
 }
 
 // ---------- 유틸 ----------
@@ -161,32 +169,21 @@ async function fetchOperation(opPath: string, fromDate: string, toDate: string):
 }
 
 function toCollectedRow(label: string, item: RawItem): CollectedRow {
+  const price = Number(item.presmptPrce);
   return {
-    업무구분: label,
-    공고번호: item.bidNtceNo ?? "",
-    공고차수: item.bidNtceOrd ?? "",
-    공고명: item.bidNtceNm ?? "",
-    발주기관: item.ntceInsttNm ?? "",
-    수요기관: item.dminsttNm ?? "",
-    추정가격: item.presmptPrce ?? "",
-    입찰방식명: item.bidMethdNm ?? "",
-    계약방법명_후보1: item.cntrctCnclsMthdNm ?? "",
-    낙찰방법명_후보2: item.sucsfbidMthdNm ?? "",
-    공고게시일시: item.bidNtceDt ?? "",
+    work_type: label,
+    bid_ntce_no: item.bidNtceNo ?? "",
+    bid_ntce_ord: item.bidNtceOrd ?? "",
+    bid_ntce_nm: item.bidNtceNm ?? "",
+    ntce_instt_nm: item.ntceInsttNm ?? "",
+    dminstt_nm: item.dminsttNm ?? "",
+    presmpt_prce: Number.isNaN(price) ? null : price,
+    bid_methd_nm: item.bidMethdNm ?? "",
+    cntrct_mthd_candidate: item.cntrctCnclsMthdNm ?? "",
+    sucsfbid_mthd_candidate: item.sucsfbidMthdNm ?? "",
+    bid_ntce_dt: item.bidNtceDt ?? "",
+    raw: item,
   };
-}
-
-function toCsv(rows: CollectedRow[]): string {
-  const headers: (keyof CollectedRow)[] = [
-    "업무구분", "공고번호", "공고차수", "공고명", "발주기관", "수요기관",
-    "추정가격", "입찰방식명", "계약방법명_후보1", "낙찰방법명_후보2", "공고게시일시",
-  ];
-  const escape = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
-  const lines = [headers.join(",")];
-  for (const row of rows) {
-    lines.push(headers.map((h) => escape(row[h])).join(","));
-  }
-  return lines.join("\n");
 }
 
 // ---------- 실행 ----------
@@ -206,30 +203,35 @@ async function main() {
       );
       console.log(`  -> 필터 통과 ${filtered.length}건`);
 
-      allRows.push(...filtered.map((item) => toCollectedRow(label, item)));
+      const rows = filtered.map((item) => toCollectedRow(label, item));
+      allRows.push(...rows);
 
-      // 원본 JSON도 그대로 저장 (필드명 실측 확인용)
-      const rawFileName = `raw_${label}_${from}_${to}.json`;
-      fs.writeFileSync(path.join(OUTPUT_DIR, rawFileName), JSON.stringify(filtered, null, 2), "utf-8");
+      if (rows.length > 0) {
+        const { error } = await supabase
+          .from("poc2_notices")
+          .upsert(rows, { onConflict: "work_type,bid_ntce_no,bid_ntce_ord" });
+        if (error) {
+          console.error(`  ! Supabase 저장 오류 (${label}, ${from}~${to}):`, error.message);
+        } else {
+          console.log(`  -> Supabase poc2_notices 테이블에 ${rows.length}건 저장`);
+        }
+      }
     }
   }
 
-  const csv = toCsv(allRows);
-  fs.writeFileSync(path.join(OUTPUT_DIR, "poc2_summary.csv"), csv, "utf-8");
-
-  // 계약방법명_후보1 기준 분포 — 5종 확보 여부를 한눈에 보기 위함
+  // 계약방법 후보1 기준 분포 — 5종 확보 여부를 한눈에 보기 위함
   const grouped: Record<string, number> = {};
   for (const row of allRows) {
-    const key = row.계약방법명_후보1 || "(값 없음)";
+    const key = row.cntrct_mthd_candidate || "(값 없음)";
     grouped[key] = (grouped[key] ?? 0) + 1;
   }
 
-  console.log("\n=== 계약방법명_후보1 기준 분포 ===");
+  console.log("\n=== cntrct_mthd_candidate(계약방법 후보1) 기준 분포 ===");
   for (const [key, count] of Object.entries(grouped).sort((a, b) => b[1] - a[1])) {
     console.log(`  ${key}: ${count}건`);
   }
-  console.log(`\n총 ${allRows.length}건 저장 완료 -> ${OUTPUT_DIR}/poc2_summary.csv`);
-  console.log("※ 계약방법명_후보1이 비어있거나 이상하면 낙찰방법명_후보2와 raw JSON을 같이 확인할 것");
+  console.log(`\n총 ${allRows.length}건을 Supabase poc2_notices 테이블에 저장 완료`);
+  console.log("※ cntrct_mthd_candidate이 비어있거나 이상하면 sucsfbid_mthd_candidate와 raw 컬럼(원본 JSON)을 같이 확인할 것");
 }
 
 main().catch((err) => {
