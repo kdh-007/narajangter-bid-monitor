@@ -12,8 +12,6 @@
  *   3. Node 18+ : npm install 후 npx tsx scripts/poc2_collectByPeriod.ts
  *
  * 실행 전 반드시 확인/조정해야 할 것 (직접 실측 안 해본 부분이라 확신 없음)
- *   - BASE_URL의 버전 접미사(BidPublicInfoService04 등)가 현재 유효한지
- *     → data.go.kr "나라장터 입찰공고정보서비스" 활용신청 상세페이지에서 실제 Endpoint 확인
  *   - inqryBgnDt/inqryEndDt 파라미터 포맷(yyyyMMddHHmm, 12자리)과 조회 가능 기간 제한 여부
  *   - "계약방법"이 실제로 cntrctCnclsMthdNm 필드에 오는지, 아니면 sucsfbidMthdNm(낙찰방법명)
  *     쪽에 오는지 → 그래서 두 필드를 DB에 같이 남겨서 실행 후 눈으로 확인하도록 만듦
@@ -55,8 +53,8 @@ const keywordsConfig = JSON.parse(
 };
 
 // 나라장터 입찰공고정보서비스 — 업무구분별 "검색조건별 목록" 오퍼레이션
-// ⚠ 버전 접미사(04)는 확인 필요 — data.go.kr 상세페이지의 Endpoint로 교체할 것
-const BASE_URL = "https://apis.data.go.kr/1230000/BidPublicInfoService04";
+// (확인됨: data.go.kr 공식 상세페이지 + 실사용 사례 기준, 2026-09-11)
+const BASE_URL = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService";
 const OPERATIONS: { label: string; path: string }[] = [
   { label: "물품", path: "getBidPblancListInfoThngPPSSrch" },
   { label: "용역", path: "getBidPblancListInfoServcPPSSrch" },
