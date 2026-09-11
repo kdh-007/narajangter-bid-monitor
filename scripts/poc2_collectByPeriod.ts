@@ -56,7 +56,7 @@ const keywordsConfig = JSON.parse(
 // (확인됨: data.go.kr 공식 상세페이지 + 실사용 사례 기준, 2026-09-11)
 const BASE_URL = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService";
 const OPERATIONS: { label: string; path: string }[] = [
-  { label: "물품", path: "getBidPblancListInfoThngPPSSrch" },
+  // "물품"은 이미 6~9월 전체 수집 완료돼서 재실행 시 제외 (재개용 임시 조정)
   { label: "용역", path: "getBidPblancListInfoServcPPSSrch" },
   { label: "공사", path: "getBidPblancListInfoCnstwkPPSSrch" },
 ];
@@ -124,6 +124,36 @@ function passesBudget(presmptPrce: string | undefined): boolean {
   return amount >= keywordsConfig.minBudgetAmount;
 }
 
+// data.go.kr 연결이 가끔 불안정하다는 게 기존 인수인계 문서에도 나와있어서, 재시도 로직을 넣음
+const API_MAX_RETRIES = 5;
+const API_RETRY_DELAY_MS = 3000;
+const API_TIMEOUT_MS = 30000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url: string): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= API_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+      return res;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastError = err;
+      if (attempt < API_MAX_RETRIES) {
+        console.error(`  ! 연결 실패 (${attempt}/${API_MAX_RETRIES}) — ${API_RETRY_DELAY_MS / 1000}초 후 재시도`);
+        await sleep(API_RETRY_DELAY_MS);
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function fetchOperation(opPath: string, fromDate: string, toDate: string): Promise<RawItem[]> {
   const results: RawItem[] = [];
   let pageNo = 1;
@@ -142,7 +172,15 @@ async function fetchOperation(opPath: string, fromDate: string, toDate: string):
     });
     const url = `${BASE_URL}/${opPath}?serviceKey=${SERVICE_KEY}&${otherParams.toString()}`;
 
-    const res = await fetch(url);
+    let res: Response;
+    try {
+      res = await fetchWithRetry(url);
+    } catch (err) {
+      console.error(`  ! ${API_MAX_RETRIES}회 재시도 후에도 연결 실패 — ${opPath} (${fromDate}~${toDate})`);
+      console.error(`    ${(err as Error)?.message ?? err}`);
+      break;
+    }
+
     if (!res.ok) {
       const bodyText = await res.text();
       console.error(`  ! HTTP ${res.status} — ${opPath} (${fromDate}~${toDate})`);
