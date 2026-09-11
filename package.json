@@ -1,0 +1,17 @@
+{
+  "name": "jiil-poc2-contract-method",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "collect": "tsx scripts/poc2_collectByPeriod.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
