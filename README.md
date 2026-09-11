@@ -3,8 +3,9 @@
 PoC2 — 계약방법 분기 검증용 공고 수집 저장소.
 
 나라장터 입찰공고정보서비스 API에서 2026-06-01 ~ 2026-09-11 기간의 본공고를 조회해,
-기존 키워드 필터로 지일 사업 관련 공고만 걸러 수집한다. 결과에서 계약방법이 서로 다른
-사례들을 찾아 PoC2 정답표를 채우는 데 쓴다.
+기존 키워드 필터로 지일 사업 관련 공고만 걸러 수집한다. 결과는 Supabase(PoC 2 프로젝트,
+`poc2_notices` 테이블)에 저장되고, 여기서 계약방법이 서로 다른 사례들을 찾아 PoC2
+정답표를 채우는 데 쓴다.
 
 ## 준비
 
@@ -12,6 +13,7 @@ PoC2 — 계약방법 분기 검증용 공고 수집 저장소.
 npm install
 cp .env.example .env
 # .env에 DATA_GO_KR_SERVICE_KEY=발급받은키 입력
+# SUPABASE_URL / SUPABASE_KEY는 이미 채워져 있음 (PoC2 프로젝트 기준)
 ```
 
 ## 실행
@@ -20,14 +22,32 @@ cp .env.example .env
 npm run collect
 ```
 
-결과는 `output/poc2/`에 저장됨:
-- `raw_{업무구분}_{시작월}_{종료월}.json` — 월/업무구분별 원본 응답
-- `poc2_summary.csv` — 통합 요약표
+터미널에 조회 진행 로그와 함께, 계약방법 후보 필드 기준 분포가 출력된다.
+저장된 데이터는 Supabase 대시보드 → Table Editor → `poc2_notices`에서 확인 가능.
 
 ## 확인 필요 사항
 
 `scripts/poc2_collectByPeriod.ts` 상단 주석 참고 — API 버전 접미사, 날짜 파라미터 포맷,
-계약방법 필드명(cntrctCnclsMthdNm vs sucsfbidMthdNm)은 실제 실행 후 검증 필요.
+계약방법 필드명(cntrct_mthd_candidate vs sucsfbid_mthd_candidate)은 실제 실행 후 검증 필요.
+
+## poc2_notices 테이블 구조
+
+| 컬럼 | 원본 API 필드 | 설명 |
+|---|---|---|
+| work_type | - | 업무구분 (물품/용역/공사) |
+| bid_ntce_no | bidNtceNo | 공고번호 |
+| bid_ntce_ord | bidNtceOrd | 공고차수 |
+| bid_ntce_nm | bidNtceNm | 공고명 |
+| ntce_instt_nm | ntceInsttNm | 발주기관 |
+| dminstt_nm | dminsttNm | 수요기관 |
+| presmpt_prce | presmptPrce | 추정가격 |
+| bid_methd_nm | bidMethdNm | 입찰방식명(전자입찰 등 — 계약방법과 다름) |
+| cntrct_mthd_candidate | cntrctCnclsMthdNm(추정) | 계약방법 후보1 |
+| sucsfbid_mthd_candidate | sucsfbidMthdNm(추정) | 낙찰방법 후보2 |
+| bid_ntce_dt | bidNtceDt | 공고게시일시 |
+| raw | - | 원본 응답 전체(jsonb) |
+
+(work_type, bid_ntce_no, bid_ntce_ord) 조합에 unique 제약이 있어 재실행해도 중복 저장되지 않음.
 
 ## config/keywords.json
 
