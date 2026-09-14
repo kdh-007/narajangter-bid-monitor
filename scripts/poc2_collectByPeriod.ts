@@ -1,281 +1,266 @@
 /**
- * PoC2 — 계약방법 분기 검증용 공고 수집 스크립트
- *
- * 목적: 2026-06-01 ~ 2026-09-11 사이 게시된 본공고 중 기존 config/keywords.json 기준으로
- *       지일 사업과 관련된 공고만 걸러 수집하고, 계약방법 관련 후보 필드를 함께
- *       Supabase(poc2_notices 테이블)에 저장한다.
- *       이 결과에서 계약방법이 서로 다른 5건을 골라 PoC2 정답표에 채워 넣는 데 쓴다.
- *
- * 실행 전 준비
- *   1. .env에 DATA_GO_KR_SERVICE_KEY, SUPABASE_URL, SUPABASE_KEY 값 필요
- *   2. narajangter-bid-monitor/ 저장소 루트에서 실행한다고 가정 (config/keywords.json 상대경로 기준)
- *   3. Node 18+ : npm install 후 npx tsx scripts/poc2_collectByPeriod.ts
- *
- * 실행 전 반드시 확인/조정해야 할 것 (직접 실측 안 해본 부분이라 확신 없음)
- *   - inqryBgnDt/inqryEndDt 파라미터 포맷(yyyyMMddHHmm, 12자리)과 조회 가능 기간 제한 여부
- *   - "계약방법"이 실제로 cntrctCnclsMthdNm 필드에 오는지, 아니면 sucsfbidMthdNm(낙찰방법명)
- *     쪽에 오는지 → 그래서 두 필드를 DB에 같이 남겨서 실행 후 눈으로 확인하도록 만듦
+ * PoC2: 2026-08-01 ~ 2026-08-31 공고 + 참가가능지역 + 면허제한 수집.
+ * 기존 scripts/poc2_collectByPeriod.ts 전체를 이 파일로 교체한다.
+ * 기존 workflow / package.json / config/keywords.json을 그대로 사용한다.
+ * PERIOD_START, PERIOD_END 환경변수로 기간 변경 가능 (한국 공고일 기준).
+ * 추가 결과는 raw._poc2_enrichment에 저장. 별도 DB 컬럼 추가 불필요.
+ * 기존 코드의 DB 컬럼명 및 복합 UNIQUE 키를 그대로 사용한다.
+ * 기존 6~9월 데이터는 삭제하지 않는다. 조회 또는 저장 실패 시 종료코드 1.
+ * 지역/면허 조회 중 하나라도 실패하면 해당 공고를 덮어쓰지 않는다.
+ * 공식 명세: https://www.data.go.kr/data/15129394/openapi.do
  */
-
-import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
-import { createClient } from "@supabase/supabase-js";
-
-// ---------- 설정 ----------
-
-const SERVICE_KEY = process.env.DATA_GO_KR_SERVICE_KEY;
-if (!SERVICE_KEY) {
-  console.error("환경변수 DATA_GO_KR_SERVICE_KEY가 없습니다. .env를 확인하세요.");
-  process.exit(1);
-}
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("환경변수 SUPABASE_URL / SUPABASE_KEY가 없습니다. .env를 확인하세요.");
-  process.exit(1);
-}
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// 조사 기간 (필요시 직접 수정)
-const PERIOD_START = "2026-06-01";
-const PERIOD_END = "2026-09-11";
-
-// 기존 config 재사용. 저장소 루트(narajangter-bid-monitor/)에서 실행한다고 가정.
-const CONFIG_DIR = path.resolve(process.cwd(), "config");
-const keywordsConfig = JSON.parse(
-  fs.readFileSync(path.join(CONFIG_DIR, "keywords.json"), "utf-8")
-) as {
-  keywords: string[];
-  excludeKeywords: string[];
-  minBudgetAmount: number;
-};
-
-// 나라장터 입찰공고정보서비스 — 업무구분별 "검색조건별 목록" 오퍼레이션
-// (확인됨: data.go.kr 공식 상세페이지 + 실사용 사례 기준, 2026-09-11)
-const BASE_URL = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService";
-const OPERATIONS: { label: string; path: string }[] = [
-  // "물품"은 이미 6~9월 전체 수집 완료돼서 재실행 시 제외 (재개용 임시 조정)
-  { label: "용역", path: "getBidPblancListInfoServcPPSSrch" },
-  { label: "공사", path: "getBidPblancListInfoCnstwkPPSSrch" },
-];
+import { pathToFileURL } from "node:url";
 
 type RawItem = Record<string, any>;
+const BASE_URL = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService";
+const OPERATIONS = [
+  { label: "물품", operation: "getBidPblancListInfoThngPPSSrch" },
+  { label: "용역", operation: "getBidPblancListInfoServcPPSSrch" },
+  { label: "공사", operation: "getBidPblancListInfoCnstwkPPSSrch" },
+];
+const REGION_OPERATION = "getBidPblancListInfoPrtcptPsblRgn";
+const LICENSE_OPERATION = "getBidPblancListInfoLicenseLimit";
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const text = (value: unknown) => value == null ? "" : String(value).trim();
 
-interface CollectedRow {
-  work_type: string;
-  bid_ntce_no: string;
-  bid_ntce_ord: string;
-  bid_ntce_nm: string;
-  ntce_instt_nm: string;
-  dminstt_nm: string;
-  presmpt_prce: number | null;
-  bid_methd_nm: string; // bidMethdNm — "전자입찰" 등. 계약방법과는 다른 필드이니 혼동 주의
-  cntrct_mthd_candidate: string; // cntrctCnclsMthdNm 추정
-  sucsfbid_mthd_candidate: string; // sucsfbidMthdNm 추정
-  bid_ntce_dt: string;
-  raw: RawItem;
+export function normalizeOrd(value: unknown): string {
+  const ord = text(value);
+  if (!/^\d{1,3}$/.test(ord)) throw new Error("공고차수 누락 또는 형식 오류");
+  return ord.padStart(3, "0");
 }
 
-// ---------- 유틸 ----------
-
-function toApiDate(dateStr: string, endOfDay = false): string {
-  // yyyy-MM-dd -> yyyyMMddHHmm (12자리)
-  const compact = dateStr.replace(/-/g, "");
-  return compact + (endOfDay ? "2359" : "0000");
+export function parseAmount(value: unknown): number | null {
+  const s = text(value).replace(/,/g, "");
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
-function monthlyChunks(start: string, end: string): { from: string; to: string }[] {
-  // 긴 기간을 한 번에 조회 못 할 가능성을 감안해 월 단위로 쪼갬
-  const chunks: { from: string; to: string }[] = [];
-  let cursor = new Date(start + "T00:00:00");
-  const endDate = new Date(end + "T00:00:00");
-
-  while (cursor <= endDate) {
-    const chunkStart = new Date(cursor);
-    const chunkEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
-    const clippedEnd = chunkEnd > endDate ? endDate : chunkEnd;
-
-    chunks.push({
-      from: chunkStart.toISOString().slice(0, 10),
-      to: clippedEnd.toISOString().slice(0, 10),
-    });
-
-    cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
-  }
-  return chunks;
-}
-
-function matchesKeywordFilter(title: string): boolean {
-  const normalized = title.replace(/\s+/g, "");
-  const hasExclude = keywordsConfig.excludeKeywords.some((kw) =>
-    normalized.includes(kw.replace(/\s+/g, ""))
-  );
-  if (hasExclude) return false;
-
-  return keywordsConfig.keywords.some((kw) => normalized.includes(kw.replace(/\s+/g, "")));
-}
-
-function passesBudget(presmptPrce: string | undefined): boolean {
-  if (!presmptPrce) return true; // 예산 정보 없으면 통과 (기존 로직과 동일, fail-open)
-  const amount = Number(presmptPrce);
-  if (Number.isNaN(amount)) return true;
-  return amount >= keywordsConfig.minBudgetAmount;
-}
-
-// data.go.kr 연결이 가끔 불안정하다는 게 기존 인수인계 문서에도 나와있어서, 재시도 로직을 넣음
-const API_MAX_RETRIES = 5;
-const API_RETRY_DELAY_MS = 3000;
-const API_TIMEOUT_MS = 30000;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchWithRetry(url: string): Promise<Response> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= API_MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeoutId);
-      return res;
-    } catch (err) {
-      clearTimeout(timeoutId);
-      lastError = err;
-      if (attempt < API_MAX_RETRIES) {
-        console.error(`  ! 연결 실패 (${attempt}/${API_MAX_RETRIES}) — ${API_RETRY_DELAY_MS / 1000}초 후 재시도`);
-        await sleep(API_RETRY_DELAY_MS);
-      }
+export function monthlyChunks(start: string, end: string) {
+  const parse = (s: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new Error("기간은 YYYY-MM-DD 형식이어야 합니다.");
+    const d = new Date(s + "T00:00:00Z");
+    if (!Number.isFinite(d.getTime()) || d.toISOString().slice(0, 10) !== s) {
+      throw new Error("유효하지 않은 날짜입니다.");
     }
-  }
-  throw lastError;
-}
-
-async function fetchOperation(opPath: string, fromDate: string, toDate: string): Promise<RawItem[]> {
-  const results: RawItem[] = [];
-  let pageNo = 1;
-  const numOfRows = 500;
-
-  while (true) {
-    // ⚠ serviceKey는 공공데이터포털에서 이미 URL 인코딩된 값(Encoding 키)인 경우가 많아서,
-    //    URLSearchParams.set()으로 넣으면 이중 인코딩되어 400 에러가 남. 그래서 이 값만 직접 문자열에 붙임.
-    const otherParams = new URLSearchParams({
-      pageNo: String(pageNo),
-      numOfRows: String(numOfRows),
-      inqryDiv: "1", // 1 = 날짜기준 조회 (실측 필요)
-      inqryBgnDt: toApiDate(fromDate),
-      inqryEndDt: toApiDate(toDate, true),
-      type: "json",
-    });
-    const url = `${BASE_URL}/${opPath}?serviceKey=${SERVICE_KEY}&${otherParams.toString()}`;
-
-    let res: Response;
-    try {
-      res = await fetchWithRetry(url);
-    } catch (err) {
-      console.error(`  ! ${API_MAX_RETRIES}회 재시도 후에도 연결 실패 — ${opPath} (${fromDate}~${toDate})`);
-      console.error(`    ${(err as Error)?.message ?? err}`);
-      break;
-    }
-
-    if (!res.ok) {
-      const bodyText = await res.text();
-      console.error(`  ! HTTP ${res.status} — ${opPath} (${fromDate}~${toDate})`);
-      console.error(`    응답 내용: ${bodyText.slice(0, 500)}`);
-      break;
-    }
-    const data: any = await res.json();
-
-    const header = data?.response?.header;
-    if (header && header.resultCode !== "00") {
-      console.error(`  ! API 오류 [${header.resultCode}] ${header.resultMsg} — ${opPath}`);
-      break;
-    }
-
-    const body = data?.response?.body;
-    const items: RawItem[] = body?.items ?? [];
-    const normalizedItems = Array.isArray(items) ? items.filter((it) => it && typeof it === "object") : [];
-
-    results.push(...normalizedItems);
-
-    const totalCount = Number(body?.totalCount ?? 0);
-    if (pageNo * numOfRows >= totalCount || normalizedItems.length === 0) break;
-    pageNo += 1;
-  }
-
-  return results;
-}
-
-function toCollectedRow(label: string, item: RawItem): CollectedRow {
-  const price = Number(item.presmptPrce);
-  return {
-    work_type: label,
-    bid_ntce_no: item.bidNtceNo ?? "",
-    bid_ntce_ord: item.bidNtceOrd ?? "",
-    bid_ntce_nm: item.bidNtceNm ?? "",
-    ntce_instt_nm: item.ntceInsttNm ?? "",
-    dminstt_nm: item.dminsttNm ?? "",
-    presmpt_prce: Number.isNaN(price) ? null : price,
-    bid_methd_nm: item.bidMethdNm ?? "",
-    cntrct_mthd_candidate: item.cntrctCnclsMthdNm ?? "",
-    sucsfbid_mthd_candidate: item.sucsfbidMthdNm ?? "",
-    bid_ntce_dt: item.bidNtceDt ?? "",
-    raw: item,
+    return d;
   };
+  let cursor = parse(start);
+  const last = parse(end);
+  if (cursor > last) throw new Error("시작일이 종료일보다 늦습니다.");
+  const result: { from: string; to: string }[] = [];
+  while (cursor <= last) {
+    const next = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
+    const monthEnd = new Date(next.getTime() - 86400000);
+    result.push({ from: cursor.toISOString().slice(0, 10),
+      to: (monthEnd < last ? monthEnd : last).toISOString().slice(0, 10) });
+    cursor = next;
+  }
+  return result;
 }
 
-// ---------- 실행 ----------
+export function normalizeItems(value: any): RawItem[] {
+  if (value == null || value === "") return [];
+  const items = Array.isArray(value) ? value : value.item;
+  if (items == null || items === "") {
+    if (typeof value === "object" && Object.keys(value).length === 0) return [];
+    throw new Error("알 수 없는 items 응답 구조");
+  }
+  const list = Array.isArray(items) ? items : [items];
+  if (!list.every(it => it && typeof it === "object" && !Array.isArray(it))) {
+    throw new Error("items에 잘못된 항목이 있습니다.");
+  }
+  return list;
+}
 
-async function main() {
-  const chunks = monthlyChunks(PERIOD_START, PERIOD_END);
-  const allRows: CollectedRow[] = [];
+export function buildUrl(operation: string, params: Record<string, string>, key: string) {
+  // Encoding 키와 Decoding 키 모두 URLSearchParams에서 한 번만 인코딩.
+  let decoded = key.trim();
+  if (/%[0-9a-f]{2}/i.test(decoded)) decoded = decodeURIComponent(decoded);
+  const query = new URLSearchParams({ ...params, type: "json", serviceKey: decoded });
+  return `${BASE_URL}/${operation}?${query}`;
+}
 
-  for (const { label, path: opPath } of OPERATIONS) {
+class ApiError extends Error {
+  retryable: boolean;
+  constructor(message: string, retryable = false) { super(message); this.retryable = retryable; }
+}
+
+export async function fetchPage(operation: string, params: Record<string, string>, key: string) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    await sleep(300);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const res = await fetch(buildUrl(operation, params, key), { signal: controller.signal });
+      if (!res.ok) throw new ApiError(`HTTP ${res.status}`, res.status === 429 || res.status >= 500);
+      // 본문 수신까지 타임아웃 적용. URL/인증키/원문 오류 응답은 로그에 남기지 않음.
+      const bodyText = await res.text();
+      let data: any;
+      try { data = JSON.parse(bodyText); }
+      catch { throw new ApiError("JSON 응답이 아님: 인증·서비스 상태 확인 필요", true); }
+      const response = data?.response;
+      const code = text(response?.header?.resultCode);
+      if (code !== "00") {
+        throw new ApiError(`API 결과코드 ${/^[A-Z0-9_]{1,60}$/i.test(code) ? code : "미확인"}`,
+          ["01", "02", "04", "05"].includes(code));
+      }
+      const body = response?.body;
+      if (body?.totalCount == null || text(body.totalCount) === "") throw new ApiError("totalCount 누락");
+      const totalCount = Number(body.totalCount);
+      if (!Number.isSafeInteger(totalCount) || totalCount < 0) throw new ApiError("totalCount 오류");
+      return { items: normalizeItems(body.items), totalCount };
+    } catch (err) {
+      const safeError = err instanceof ApiError ? err : new ApiError("연결·응답 수신 실패", true);
+      if (!safeError.retryable || attempt === 5) throw safeError;
+      console.warn(`  ${operation}: ${safeError.message}, 재시도 ${attempt}/5`);
+    } finally { clearTimeout(timer); }
+    await sleep(Math.min(3000 * 2 ** (attempt - 1), 15000));
+  }
+  throw new ApiError("재시도 종료");
+}
+
+export async function fetchAll(operation: string, params: Record<string, string>, key: string) {
+  const results: RawItem[] = [];
+  const numOfRows = 500;
+  let previousPage = "";
+  for (let pageNo = 1; pageNo <= 10000; pageNo++) {
+    const page = await fetchPage(operation, { ...params, pageNo: String(pageNo), numOfRows: String(numOfRows) }, key);
+    if (!page.items.length) {
+      if (results.length < page.totalCount) throw new ApiError("전체 건수에 못 미친 빈 페이지");
+      return results;
+    }
+    const fingerprint = JSON.stringify(page.items);
+    if (fingerprint === previousPage) throw new ApiError("동일 페이지 반복 수신");
+    previousPage = fingerprint;
+    results.push(...page.items);
+    if (results.length >= page.totalCount) return results;
+  }
+  throw new ApiError("페이지 안전 한도 초과");
+}
+
+export function validateDetails(items: RawItem[], no: string, ord: string, label: string) {
+  for (const item of items) {
+    if (text(item.bidNtceNo) !== no || normalizeOrd(item.bidNtceOrd) !== ord) {
+      throw new Error("추가 조회 결과의 공고번호·차수가 요청과 다릅니다.");
+    }
+    if (text(item.bsnsDivNm) && text(item.bsnsDivNm) !== label) {
+      throw new Error("추가 조회 결과의 업무구분이 요청과 다릅니다.");
+    }
+  }
+  return items; // 그룹·순번·복수 지역/면허를 축약하지 않고 보존
+}
+
+export async function main() {
+  await import("dotenv/config");
+  const { createClient } = await import("@supabase/supabase-js");
+  const required = (name: string) => {
+    const value = process.env[name]?.trim();
+    if (!value) throw new Error(`환경변수 ${name}가 없습니다.`);
+    return value;
+  };
+  const key = required("DATA_GO_KR_SERVICE_KEY");
+  const supabase = createClient(required("SUPABASE_URL"), required("SUPABASE_KEY"));
+  const start = process.env.PERIOD_START ?? "2026-08-01";
+  const end = process.env.PERIOD_END ?? "2026-08-31";
+  const chunks = monthlyChunks(start, end);
+  const config = JSON.parse(fs.readFileSync(path.resolve("config/keywords.json"), "utf8"));
+  for (const field of ["keywords", "excludeKeywords"]) {
+    if (!Array.isArray(config[field]) || !config[field].every((v: unknown) => typeof v === "string" && v.trim())) {
+      throw new Error(`keywords.json의 ${field} 형식 오류`);
+    }
+  }
+  const minBudget = parseAmount(config.minBudgetAmount);
+  if (minBudget == null || minBudget < 0) throw new Error("minBudgetAmount 설정 오류");
+  const compact = (s: string) => s.replace(/\s+/g, "");
+  let matched = 0, saved = 0, failedNotices = 0, failedChunks = 0;
+  let regionEmpty = 0, licenseEmpty = 0;
+  const seen = new Set<string>();
+  const distribution: Record<string, number> = {};
+  console.log(`수집 기간: ${start} 00:00 ~ ${end} 23:59 (한국 공고일 기준)`);
+  for (const { label, operation } of OPERATIONS) {
     for (const { from, to } of chunks) {
-      console.log(`[${label}] ${from} ~ ${to} 조회 중...`);
-      const items = await fetchOperation(opPath, from, to);
-      console.log(`  -> ${items.length}건 수신`);
-
-      const filtered = items.filter(
-        (item) => matchesKeywordFilter(item.bidNtceNm ?? "") && passesBudget(item.presmptPrce)
-      );
-      console.log(`  -> 필터 통과 ${filtered.length}건`);
-
-      const rows = filtered.map((item) => toCollectedRow(label, item));
-      allRows.push(...rows);
-
-      if (rows.length > 0) {
-        const { error } = await supabase
-          .from("poc2_notices")
-          .upsert(rows, { onConflict: "work_type,bid_ntce_no,bid_ntce_ord" });
-        if (error) {
-          console.error(`  ! Supabase 저장 오류 (${label}, ${from}~${to}):`, error.message);
-        } else {
-          console.log(`  -> Supabase poc2_notices 테이블에 ${rows.length}건 저장`);
+      let items: RawItem[];
+      try {
+        items = await fetchAll(operation, { inqryDiv: "1",
+          inqryBgnDt: from.replace(/-/g, "") + "0000",
+          inqryEndDt: to.replace(/-/g, "") + "2359" }, key);
+      } catch (err) {
+        failedChunks++;
+        console.error(`[${label}] ${from}~${to} 목록 수집 실패: ${(err as Error).message}`);
+        continue;
+      }
+      console.log(`[${label}] ${from}~${to}: ${items.length}건 수신`);
+      for (const item of items) {
+        const title = compact(text(item.bidNtceNm));
+        if (config.excludeKeywords.some((kw: string) => title.includes(compact(kw))) ||
+            !config.keywords.some((kw: string) => title.includes(compact(kw)))) continue;
+        const price = parseAmount(item.presmptPrce);
+        if (price != null && price < minBudget) continue;
+        // 원본 공고일로 기간을 재확인: 과거 데이터가 이번 실행에 섞이지 않게 함.
+        const date = text(item.bidNtceDt).slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+          failedNotices++; console.error(`[${label}] 공고일 누락/형식 오류`); continue;
+        }
+        if (date < from || date > to) continue;
+        matched++;
+        const no = text(item.bidNtceNo);
+        try {
+          if (!no) throw new Error("공고번호 누락");
+          const ord = normalizeOrd(item.bidNtceOrd);
+          const id = `${label}:${no}:${ord}`;
+          if (seen.has(id)) { matched--; continue; }
+          seen.add(id);
+          // 2: 공고번호 조회. 특정 차수를 지정해 다른 차수 정보가 섞이지 않게 한다.
+          const params = { inqryDiv: "2", bidNtceNo: no, bidNtceOrd: ord };
+          const regions = validateDetails(await fetchAll(REGION_OPERATION, params, key), no, ord, label);
+          const licenses = validateDetails(await fetchAll(LICENSE_OPERATION, params, key), no, ord, label);
+          const entry = (operation: string, records: RawItem[]) => ({
+            operation, status: records.length ? "ok" : "no_data",
+            fetched_at: new Date().toISOString(), items: records,
+          });
+          const row = {
+            work_type: label, bid_ntce_no: no, bid_ntce_ord: ord,
+            bid_ntce_nm: text(item.bidNtceNm), ntce_instt_nm: text(item.ntceInsttNm),
+            dminstt_nm: text(item.dminsttNm), presmpt_prce: price,
+            bid_methd_nm: text(item.bidMethdNm),
+            cntrct_mthd_candidate: text(item.cntrctCnclsMthdNm),
+            sucsfbid_mthd_candidate: text(item.sucsfbidMthdNm),
+            bid_ntce_dt: item.bidNtceDt,
+            raw: { ...item, _poc2_enrichment: {
+              schema_version: 1,
+              regions: entry(REGION_OPERATION, regions),
+              licenses: entry(LICENSE_OPERATION, licenses),
+              note: "no_data는 API 조회 결과 없음이며 제한 없음이나 자격 충족을 뜻하지 않습니다.",
+            } },
+          };
+          const { error } = await supabase.from("poc2_notices")
+            .upsert(row, { onConflict: "work_type,bid_ntce_no,bid_ntce_ord" });
+          if (error) throw new Error(`Supabase 저장 실패 (코드 ${error.code ?? "미확인"}): 컬럼/권한/고유키 확인`);
+          saved++;
+          if (!regions.length) regionEmpty++;
+          if (!licenses.length) licenseEmpty++;
+          const method = row.cntrct_mthd_candidate || "(값 없음)";
+          distribution[method] = (distribution[method] ?? 0) + 1;
+          console.log(`  저장 ${label} ${no}-${ord}: 지역 ${regions.length}건, 면허 ${licenses.length}건`);
+        } catch (err) {
+          failedNotices++;
+          console.error(`  실패 ${label} ${no}: ${(err as Error).message} — 해당 공고 저장 보류`);
         }
       }
     }
   }
-
-  // 계약방법 후보1 기준 분포 — 5종 확보 여부를 한눈에 보기 위함
-  const grouped: Record<string, number> = {};
-  for (const row of allRows) {
-    const key = row.cntrct_mthd_candidate || "(값 없음)";
-    grouped[key] = (grouped[key] ?? 0) + 1;
+  console.log("계약방법 분포 (이번 실행 저장 성공 건):", distribution);
+  console.log(`대상 ${matched}건 / 저장 성공 ${saved}건 / 공고 실패 ${failedNotices}건 / 목록 구간 실패 ${failedChunks}건`);
+  console.log(`저장 성공 중 지역 API 결과 없음 ${regionEmpty}건 / 면허 API 결과 없음 ${licenseEmpty}건`);
+  if (failedNotices || failedChunks) {
+    throw new Error("일부 수집·저장 실패. 성공 건은 저장되었으며 로그 확인 후 재실행하세요.");
   }
-
-  console.log("\n=== cntrct_mthd_candidate(계약방법 후보1) 기준 분포 ===");
-  for (const [key, count] of Object.entries(grouped).sort((a, b) => b[1] - a[1])) {
-    console.log(`  ${key}: ${count}건`);
-  }
-  console.log(`\n총 ${allRows.length}건을 Supabase poc2_notices 테이블에 저장 완료`);
-  console.log("※ cntrct_mthd_candidate이 비어있거나 이상하면 sucsfbid_mthd_candidate와 raw 컬럼(원본 JSON)을 같이 확인할 것");
+  console.log("수집 완료. 기존 기간 외 데이터는 삭제하지 않았습니다.");
 }
 
-main().catch((err) => {
-  console.error("실행 중 오류:", err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch(err => { console.error((err as Error).message); process.exitCode = 1; });
+}
