@@ -90,65 +90,180 @@ class ApiError extends Error {
   constructor(message: string, retryable = false) { super(message); this.retryable = retryable; }
 }
 
-export async function fetchPage(operation: string, params: Record<string, string>, key: string) {
-  const safeMessage = (value: unknown) => {
-    let out = text(value);
-    for (const variant of [key, encodeURIComponent(key), decodeURIComponent(key)]) out = out.split(variant).join("[REDACTED]");
-    return out.slice(0, 500);
-  };
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    await sleep(300);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
+export async function fetchPage(
+  operation: string,
+  params: Record<string, string>,
+  key: string
+) {
+  const TIMEOUT_MS = 30000;
+  const MAX_ATTEMPTS = 2;
+
+  const safeMessage = (value: unknown): string => {
+    let message = text(value);
+
+    const variants = [key, encodeURIComponent(key)];
+
     try {
-      const res = await fetch(buildUrl(operation, params, key), { signal: controller.signal });
-      if (!res.ok) throw new ApiError(`HTTP ${res.status}`, res.status === 429 || res.status >= 500);
-      // 본문 수신까지 타임아웃 적용. URL/인증키/원문 오류 응답은 로그에 남기지 않음.
+      variants.push(decodeURIComponent(key));
+    } catch {
+      // 디코딩할 수 없는 키는 원래 값으로 마스킹한다.
+    }
+
+    for (const variant of variants) {
+      if (variant) {
+        message = message.split(variant).join("[REDACTED]");
+      }
+    }
+
+    return message
+      .replace(/serviceKey=[^&\s]+/gi, "serviceKey=[REDACTED]")
+      .slice(0, 800);
+  };
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    await sleep(300);
+
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      TIMEOUT_MS
+    );
+
+    try {
+      console.log(
+        `[API 요청] ${operation} / 페이지 ${params.pageNo ?? "1"} / ` +
+        `${attempt}/${MAX_ATTEMPTS}회 / 제한시간 30초`
+      );
+
+      const res = await fetch(
+        buildUrl(operation, params, key),
+        { signal: controller.signal }
+      );
+
+      if (!res.ok) {
+        throw new ApiError(
+          `HTTP ${res.status} ${res.statusText}`,
+          res.status === 429 || res.status >= 500
+        );
+      }
+
       const bodyText = await res.text();
       let data: any;
-      try { data = JSON.parse(bodyText); }
-      catch {
-        const match = bodyText.match(/<(?:returnAuthMsg|returnReasonCode|errMsg)>([^<]*)</);
-        throw new ApiError(`${operation}: JSON 응답이 아님 ${match ? safeMessage(match[1]) : "(인증·서비스 상태 확인)"}`, false);
+
+      try {
+        data = JSON.parse(bodyText);
+      } catch {
+        const match = bodyText.match(
+          /<(?:returnAuthMsg|returnReasonCode|errMsg)>([^<]*)</
+        );
+
+        throw new ApiError(
+          "JSON 형식이 아닌 응답 수신: " +
+          (match
+            ? safeMessage(match[1])
+            : `Content-Type=${res.headers.get("content-type") ?? "없음"}`),
+          false
+        );
       }
+
       const response = data?.response;
       const code = text(response?.header?.resultCode);
-      if (code !== "00") {
-        throw new ApiError(`${operation}: API 결과코드 ${/^[A-Z0-9_]{1,60}$/i.test(code) ? code : "미확인"}, ${safeMessage(response?.header?.resultMsg)}`,
-          ["01", "02", "04", "05"].includes(code));
-      }
-      const body = response?.body;
-      if (body?.totalCount == null || text(body.totalCount) === "") throw new ApiError("totalCount 누락");
-      const totalCount = Number(body.totalCount);
-      if (!Number.isSafeInteger(totalCount) || totalCount < 0) throw new ApiError("totalCount 오류");
-      return { items: normalizeItems(body.items), totalCount };
-    } catch (err) {
-      const safeError = err instanceof ApiError ? err : new ApiError("연결·응답 수신 실패", true);
-      if (!safeError.retryable || attempt === 2) throw new ApiError(`${operation}: ${safeError.message}`);
-      console.warn(`  ${operation}: ${safeError.message}, 재시도 ${attempt}/2`);
-    } finally { clearTimeout(timer); }
-    await sleep(Math.min(1000 * 2 ** (attempt - 1), 2000));
-  }
-  throw new ApiError("재시도 종료");
-}
 
-export async function fetchAll(operation: string, params: Record<string, string>, key: string) {
-  const results: RawItem[] = [];
-  const numOfRows = 500;
-  let previousPage = "";
-  for (let pageNo = 1; pageNo <= 10000; pageNo++) {
-    const page = await fetchPage(operation, { ...params, pageNo: String(pageNo), numOfRows: String(numOfRows) }, key);
-    if (!page.items.length) {
-      if (results.length < page.totalCount) throw new ApiError("전체 건수에 못 미친 빈 페이지");
-      return results;
+      if (code !== "00") {
+        throw new ApiError(
+          `API 코드=${safeMessage(code) || "없음"}, ` +
+          `메시지=${safeMessage(response?.header?.resultMsg) || "없음"}`,
+          ["01", "02", "04", "05"].includes(code)
+        );
+      }
+
+      const body = response?.body;
+
+      if (
+        body?.totalCount == null ||
+        text(body.totalCount) === ""
+      ) {
+        throw new ApiError("응답에 totalCount가 없습니다.");
+      }
+
+      const totalCount = Number(body.totalCount);
+
+      if (
+        !Number.isSafeInteger(totalCount) ||
+        totalCount < 0
+      ) {
+        throw new ApiError("응답의 totalCount가 올바르지 않습니다.");
+      }
+
+      const items = normalizeItems(body.items);
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+      console.log(
+        `[API 성공] ${operation} / ${elapsed}초 / ${items.length}건`
+      );
+
+      return { items, totalCount };
+    } catch (err) {
+      const error = err as Error & {
+        code?: string;
+        cause?: {
+          code?: string;
+          message?: string;
+        };
+      };
+
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+      const timedOut = controller.signal.aborted;
+
+      console.error(
+        "[API 오류 상세]",
+        JSON.stringify(
+          {
+            operation,
+            pageNo: params.pageNo ?? "1",
+            attempt,
+            elapsedSeconds: elapsed,
+            timedOut,
+            name: safeMessage(error?.name),
+            code: safeMessage(error?.code),
+            message: timedOut
+              ? "요청 시작 후 30초 안에 응답 수신을 완료하지 못했습니다."
+              : safeMessage(error?.message),
+            causeCode: safeMessage(error?.cause?.code),
+            causeMessage: safeMessage(error?.cause?.message),
+          },
+          null,
+          2
+        )
+      );
+
+      const retryable =
+        err instanceof ApiError
+          ? err.retryable
+          : timedOut ||
+            error?.name === "TypeError" ||
+            Boolean(error?.cause?.code);
+
+      if (!retryable || attempt === MAX_ATTEMPTS) {
+        throw new ApiError(
+          `${operation}: ${
+            timedOut
+              ? "30초 응답 시간초과"
+              : safeMessage(error?.message) || "원인 미확인"
+          } — 위 API 오류 상세 확인`
+        );
+      }
+
+      console.warn("[재시도 예정] 1초 후 한 번 더 요청합니다.");
+    } finally {
+      clearTimeout(timer);
     }
-    const fingerprint = JSON.stringify(page.items);
-    if (fingerprint === previousPage) throw new ApiError("동일 페이지 반복 수신");
-    previousPage = fingerprint;
-    results.push(...page.items);
-    if (results.length >= page.totalCount) return results;
+
+    await sleep(1000);
   }
-  throw new ApiError("페이지 안전 한도 초과");
+
+  throw new ApiError(`${operation}: 요청 종료`);
 }
 
 // 전체 월 수집이 끝나기를 기다리지 않고, 페이지마다 실제 작업을 진행한다.
